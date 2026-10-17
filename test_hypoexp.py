@@ -449,3 +449,104 @@ def test_class_interface_consistency():
     assert erlang.sample(7).shape == (7,) and Hypoexponential([2.0]).sample(4).shape == (4,)
     np.random.seed(5)
     assert Hypoexponential([1.0, 2.0]).sample(100_000).mean() == pytest.approx(1.5, rel=0.02)
+
+
+# ---- Floating-point range regressions ---------------------------------------------------------
+
+@pytest.mark.parametrize('method', ['auto', 'phase_type'])
+@pytest.mark.parametrize('scales,x', [
+    ([1e-308, 1.0, 1.0], 1.0),
+    ([1.0, 1e-308, 1.0], 1.0),
+    ([1.0, 1.0, 1e-308], 1.0),
+    ([1e-110, 1e200, 1e200], 1e200),
+])
+def test_phase_scaling_does_not_overflow(scales, x, method):
+    # The fast phase is negligible here; the two slow phases give Erlang(2).
+    scale = max(scales)
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        p = hypoexp_pdf(x, scales, method=method)
+        c = hypoexp_cdf(x, scales, method=method)
+    assert p == pytest.approx(np.exp(-1) / scale, rel=3e-12, abs=0)
+    assert c == pytest.approx(1 - 2 * np.exp(-1), rel=3e-12, abs=0)
+
+
+@pytest.mark.parametrize('x,scales', [(1e308, [1.0, 1.0]), (1e100, [1e-300, 1e-299])])
+def test_extreme_right_tail_finishes_with_exact_limits(x, scales):
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        assert hypoexp_pdf(x, scales) == 0.0
+        assert hypoexp_cdf(x, scales, method='phase_type') == 1.0
+
+
+def test_cdf_with_overflowing_reciprocal_rates():
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        assert hypoexp_cdf(1e-309, [1e-309, 1e-309]) == pytest.approx(1 - 2 * np.exp(-1), rel=3e-12)
+
+
+@pytest.mark.parametrize('n,scale,x', [
+    (2, 1e-300, 8e-298),
+    (2, 1e-100, 750e-100),
+    (4, 1e-200, 1e-310),
+    (100, 1e-300, 1e-304),
+])
+@pytest.mark.parametrize('method', ['auto', 'phase_type'])
+def test_pdf_survives_underflow_of_phase_probability(n, scale, x, method):
+    # Exact Erlang reference from the actual binary float inputs, without perturbing scales.
+    t, s = mpmath.mpf(x), mpmath.mpf(scale)
+    ref = float(mpmath.exp((n - 1) * mpmath.log(t) - n * mpmath.log(s)
+                          - t / s - mpmath.loggamma(n)))
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        got = hypoexp_pdf(x, np.full(n, scale), method=method)
+    assert ref > 0
+    assert got == pytest.approx(ref, rel=3e-12, abs=0)
+
+
+@pytest.mark.parametrize('scales', [[1e-300, 1.0, 1.0], [1.0, 1e-300, 1.0], [1.0, 1.0, 1e-300]])
+def test_stiff_pdf_is_invariant_under_phase_order(scales):
+    assert hypoexp_pdf(100.0, scales) == pytest.approx(100 * np.exp(-100), rel=3e-12, abs=0)
+
+
+@pytest.mark.parametrize('x,scales', [
+    (1e-170, [1e-170, 1e160]),
+    (1e-160, [1e-160, 1e160]),
+    (750e-100, [1e-100, 1.01e-100]),
+    (1e-308, [1e308, 1e-308]),
+])
+def test_closed_form_underflow_triggers_accurate_fallback(x, scales):
+    t = mpmath.mpf(x)
+    a, b = map(mpmath.mpf, scales)
+    ref = float((mpmath.exp(-t / b) - mpmath.exp(-t / a)) / (b - a))
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        got = hypoexp_pdf(x, scales)
+    assert got == pytest.approx(ref, rel=3e-12, abs=0)
+
+
+def test_closed_form_bound_includes_exponent_sensitivity():
+    x, scale = 700.123, 1.234
+    ref = float(mpmath.exp(-mpmath.mpf(x) / mpmath.mpf(scale)) / mpmath.mpf(scale))
+    assert hypoexp_pdf(x, scale, tolerance=1e-14) == pytest.approx(ref, rel=1e-14, abs=0)
+
+
+def test_logarithmic_series_normalizes_poisson_weights():
+    scales = np.array([1e-310] + [1e-306] * 15)
+    x = 99999 * scales[0]
+    with mpmath.workdps(80):
+        Q = mpmath.matrix(scales.size + 1)
+        for i, scale in enumerate(scales):
+            rate = 1 / mpmath.mpf(float(scale))
+            Q[i, i], Q[i, i + 1] = -rate, rate
+        ref = float(mpmath.expm(mpmath.mpf(float(x)) * Q)[0, scales.size])
+    assert hypoexp_cdf(x, scales, method='phase_type') == pytest.approx(ref, rel=5e-11, abs=0)
+
+
+@pytest.mark.parametrize('method', ['auto', 'phase_type'])
+def test_subnormal_scale_with_finite_density_does_not_warn(method):
+    x, scale = 1e-308, 1e-310
+    ref = float(mpmath.exp(-mpmath.mpf(x) / mpmath.mpf(scale)) / mpmath.mpf(scale))
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        assert hypoexp_pdf(x, [scale], method=method) == pytest.approx(ref, rel=3e-12, abs=0)

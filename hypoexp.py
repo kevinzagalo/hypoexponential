@@ -9,6 +9,9 @@ import concurrent.futures
 ArrayLike = Union[int, float, list, 'np.ndarray']
 
 _EPS = np.finfo(float).eps
+_TINY = np.finfo(float).tiny
+_LOG2_EPS = np.log2(_EPS)
+_LOG2_SMALLEST = np.log2(np.finfo(float).smallest_subnormal)
 _METHODS = ('auto', 'closed_form', 'decimal', 'convolution', 'phase_type')
 _CONVOLUTION_MIN_POINTS = 10 ** 5
 
@@ -79,11 +82,13 @@ def _closed_form_method(x, scales, kind):
 
     When scales are close, the denominators (\omega_i - \omega_j) make the w_i huge with alternating
     signs and the sum suffers catastrophic cancellation. We therefore also return, for each point,
-    an upper bound on the relative rounding error of the float result:
+    a cancellation bound on the relative rounding error of the float result:
         4 n eps * sum_i |term_i| / |sum_i term_i|
     (the w_i are each accurate to ~2n eps since the differences of close floats are exact, and the
     sum of n terms loses at most eps per term relative to sum|term_i|). The caller rejects points
-    whose bound exceeds the tolerance and recomputes them with a slower method.
+    whose bound exceeds the tolerance and recomputes them with a slower method. For the PDF,
+    an additional term accounts for rounding in x/scale before exponentiation. Subnormal
+    intermediates invalidate this relative-error model and force a fallback.
 
     Returns (value, relative_error_bound), both arrays of len(x). Non-finite values (overflowed
     weights) must also be treated as failures by the caller.
@@ -91,24 +96,39 @@ def _closed_form_method(x, scales, kind):
     n = scales.size
     # Everything is vectorized over (scale i, point k). Overflow / division by zero are allowed
     # here on purpose: they produce inf/nan values that the caller treats as failed points.
-    with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+    with np.errstate(divide='ignore', invalid='ignore', over='ignore', under='ignore'):
         # ratio[i, j] = omega_i / (omega_i - omega_j); the diagonal (i == j) is set to 1 so that
         # the row product gives w_i = prod_{j != i} ratio[i, j]
         ratio = scales[:, None] / (scales[:, None] - scales[None, :])
         np.fill_diagonal(ratio, 1.0)
-        weights = np.prod(ratio, axis=1)
+        unsafe_weights = np.any(np.abs(ratio) < _TINY)
+        # Check intermediate products too: a lost factor cannot be recovered by a later one.
+        np.cumprod(ratio, axis=1, out=ratio)
+        unsafe_weights |= np.any(np.abs(ratio) < _TINY)
+        weights = ratio[:, -1]
         # basis[i, k] = e^{-x_k/omega_i}/omega_i (pdf) or 1 - e^{-x_k/omega_i} (cdf; expm1 keeps
         # full relative accuracy for small x)
+        z = x[None, :] / scales[:, None]
         if kind == 'pdf':
-            basis = np.exp(-x[None, :] / scales[:, None]) / scales[:, None]
+            exponential = np.exp(-z)
+            basis = exponential / scales[:, None]
         else:
-            basis = -np.expm1(-x[None, :] / scales[:, None])
+            basis = -np.expm1(-z)
         terms = weights[:, None] * basis
         value = np.sum(terms, axis=0)
         # a posteriori error bound: the n rounded terms can each be off by ~eps relative, so the
         # absolute error of the sum is ~eps * sum|terms|; dividing by |value| gives the relative
         # error, which explodes exactly when the terms cancel (close scales)
         rel_err = 4 * n * _EPS * np.sum(np.abs(terms), axis=0) / np.abs(value)
+        if kind == 'pdf':
+            # Division error in z is amplified by exp(-z), especially far into the tail.
+            rel_err += _EPS * np.sum(np.abs(terms) * z, axis=0) / np.abs(value)
+        unsafe_points = np.any((np.abs(basis) < _TINY) | (np.abs(terms) < _TINY), axis=0)
+        if kind == 'pdf':
+            unsafe_points |= np.any(exponential < _TINY, axis=0)
+        # The relative-error model assumes normal operands. Underflow can silently remove
+        # a significant term even when the final sum is finite and far from zero.
+        rel_err[unsafe_points | unsafe_weights] = np.inf
     return value, rel_err
 
 
@@ -451,7 +471,138 @@ def _phase_type_plan(lam, n):
     return threshold, best_cost
 
 
+def _log2_matmul(a, b):
+    """Matrix product in log2 space, with O(n^2) temporary storage."""
+    out = np.empty_like(a)
+    # A logarithm can overflow negatively only for a probability indistinguishable
+    # from zero even after multiplying by any representable input rate.
+    with np.errstate(over='ignore', under='ignore'):
+        for i in range(a.shape[0]):
+            out[i] = np.logaddexp2.reduce(a[i, :, None] + b, axis=0)
+    return out
+
+
+def _phase_type_log(x, scales, kind):
+    """Uniformization in log2 space for values outside the safe floating-point range.
+
+    Keep transitions, Poisson weights, and the final rate in logarithmic form until the
+    density/CDF is complete. frexp avoids overflowing rates, x/min(scales), or 2**s.
+    Base two also makes repeated doubling exact in the exponent.
+    """
+    # Convolution is invariant under permutation; leave the slowest phase last to
+    # reduce cancellation when converting the logarithmic probability to a density.
+    scales = np.sort(scales)
+    n = scales.size
+    mantissas, exponents = np.frexp(scales)
+    fastest = np.argmin(scales)
+    sm, se = mantissas[fastest], exponents[fastest]
+    logmove = np.log2(sm / mantissas) + (se - exponents)
+    with np.errstate(divide='ignore', under='ignore'):
+        logstay = np.log2(-np.expm1(logmove * np.log(2.0)))
+    log_last_scale = np.log2(mantissas[-1]) + exponents[-1]
+    out = np.empty(x.size)
+    for j, point in enumerate(x):
+        xm, xe = np.frexp(point)
+        q, qe = xm / sm, int(xe) - int(se)
+        loglam = np.log2(q) + qe
+        col = n - 1 if kind == 'pdf' else n
+        if n >= 16 and loglam <= np.log2(_SERIES_MAX_LAMBDA):
+            # A bidiagonal recursion avoids cubic matrix work for many phases.
+            lam = np.exp2(loglam)
+            v = np.full(n + 1, -np.inf)
+            v[0] = 0.0
+            logw = -lam / np.log(2.0)
+            acc = -np.inf
+            wsum = -np.inf
+            k = 0
+            while True:
+                acc = np.logaddexp2(acc, logw + v[col])
+                wsum = np.logaddexp2(wsum, logw)
+                if k + 1 > lam:
+                    tail = logw + loglam - np.log2(k + 1 - lam)
+                    cutoff = _LOG2_SMALLEST - 2 + (log_last_scale if kind == 'pdf' else 0)
+                    if tail <= max(acc + _LOG2_EPS, cutoff):
+                        break
+                nxt = np.empty_like(v)
+                nxt[:n] = v[:n] + logstay
+                nxt[1:n] = np.logaddexp2(nxt[1:n], v[:n - 1] + logmove[:n - 1])
+                nxt[n] = np.logaddexp2(v[n], v[n - 1] + logmove[-1])
+                v = nxt
+                k += 1
+                logw += loglam - np.log2(k)
+            # Cancel the common Poisson-weight error accumulated en route to the mode.
+            result = acc - wsum
+        else:
+            s = max(0, qe + int(q > 1))
+            logtheta = np.log2(q) + (qe - s)
+            theta = np.exp2(logtheta)
+            A = np.full((n + 1, n + 1), -np.inf)
+            idx = np.arange(n)
+            A[idx, idx] = logtheta + logstay
+            A[idx, idx + 1] = logtheta + logmove
+            A[n, n] = logtheta
+            E = np.full_like(A, -np.inf)
+            np.fill_diagonal(E, 0.0)
+            term = E.copy()
+            for k in range(1, n + 100):
+                term = _log2_matmul(term, A) - np.log2(k)
+                E = np.logaddexp2(E, term)
+                if k >= n and np.all(term <= E + _LOG2_EPS):
+                    break
+            E -= theta / np.log(2.0)
+            for _ in range(s):
+                E = _log2_matmul(E, E)
+                E -= np.logaddexp2.reduce(E, axis=1)[:, None]
+            result = E[0, col]
+        if kind == 'pdf':
+            result -= log_last_scale
+        # A density can legitimately overflow; probabilities cannot exceed one.
+        with np.errstate(over='ignore', under='ignore'):
+            out[j] = np.exp2(result if kind == 'pdf' else min(result, 0.0))
+    return out
+
+
 def _phase_type_method(x, scales, kind):
+    """Use the fast phase-type calculation where safe, logarithms at range limits."""
+    x = np.asarray(x, dtype=float)
+    scales = np.sort(scales)
+    out = np.zeros(x.size)
+    positive = x > 0
+    if kind == 'pdf' and scales.size == 1 and np.any(x == 0):
+        with np.errstate(over='ignore'):
+            out[x == 0] = 1.0 / scales[0]
+    logscales = np.log(scales)
+    if kind == 'pdf':
+        # Integrating the product of exponential densities over the simplex gives
+        # f(x) <= exp(-x/s_max) x**(n-1) / ((n-1)! prod(scales)). This bound can
+        # establish a true floating-point zero without losing a representable density.
+        with np.errstate(over='ignore', divide='ignore'):
+            logx = np.log(x, where=positive, out=np.zeros_like(x))
+            bound = (-x / scales.max() + (scales.size - 1) * logx
+                     - sp.special.gammaln(scales.size) - logscales.sum())
+        positive &= bound >= (_LOG2_SMALLEST * np.log(2.0) - 2)
+    idx = np.flatnonzero(positive)
+    if not idx.size:
+        return out
+    points = x[idx]
+    unsafe_scales = scales.min() < _TINY or logscales.max() - logscales.min() > -np.log(_TINY)
+    unsafe = (np.log2(points) - np.log2(scales.min()) >= 1023) | unsafe_scales
+    if np.any(~unsafe):
+        ordinary = np.flatnonzero(~unsafe)
+        values = _phase_type_float(points[ordinary], scales, kind)
+        out[idx[ordinary]] = values
+        if kind == 'pdf' and scales[-1] < 1:
+            # Inspect the probability before rate multiplication: even a normal density
+            # can have lost precision in a subnormal intermediate probability.
+            with np.errstate(divide='ignore'):
+                lost = np.log(values) + logscales[-1] < np.log(_TINY)
+            unsafe[ordinary[lost]] = True
+    if np.any(unsafe):
+        out[idx[unsafe]] = _phase_type_log(points[unsafe], scales, kind)
+    return out
+
+
+def _phase_type_float(x, scales, kind):
     """Phase-type representation, valid for any scales including repeated ones.
     https://en.wikipedia.org/wiki/Hypoexponential_distribution#Relation_to_the_phase-type_distribution
 
@@ -571,7 +722,10 @@ def _choose_slow_method(x, scales, digits, tolerance):
     if tolerance < 1e-12:
         return 'decimal'
     m, n = x.size, scales.size
-    lam = x * (1.0 / scales).max()
+    # Infinite lambda is a valid cost-model input (it selects squaring). The actual
+    # phase calculation handles such points in logarithmic space.
+    with np.errstate(over='ignore'):
+        lam = x / scales.min()
     if _predicted_cost('decimal', m, n, digits) < _predicted_cost('phase_type', m, n, digits, lam):
         return 'decimal'
     return 'phase_type'
@@ -635,8 +789,10 @@ def _sanity_failures(x, values, kind, scales, tolerance):
         failures.append('negative values')
     if kind == 'cdf' and np.any(values > 1 + 1e-12):
         failures.append('cdf above 1')
-    if kind == 'pdf' and scales.size > 1 and np.any(values > 1.0 / scales.min()):
-        failures.append('pdf above the bound 1/min(scales)')
+    if kind == 'pdf' and scales.size > 1:
+        with np.errstate(over='ignore'):
+            if np.any(values * scales.min() > 1):
+                failures.append('pdf above the bound 1/min(scales)')
 
     if x.size >= 3:
         order = np.argsort(x, kind='stable')
@@ -685,7 +841,9 @@ def _evaluate(x, scales, kind, tolerance, method):
     out = np.full(xf.shape, np.nan)
     out[xf < 0] = 0.0
     out[xf == np.inf] = 0.0 if kind == 'pdf' else 1.0
-    out[xf == 0] = (1.0 / scales[0] if n == 1 else 0.0) if kind == 'pdf' else 0.0
+    if np.any(xf == 0):
+        with np.errstate(over='ignore'):
+            out[xf == 0] = (1.0 / scales[0] if n == 1 else 0.0) if kind == 'pdf' else 0.0
     valid = np.isfinite(xf) & (xf > 0)
     xv = xf[valid]
 
