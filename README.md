@@ -38,7 +38,7 @@ $\theta_i = 1 / \eta_i$, so
 $$
 \mathbb{E}[X] = \sum_{i=1}^{n} \theta_i,
 \qquad
-\operatorname{Var}(X) = \sum_{i=1}^{n} \theta_i^2.
+\mathrm{Var}(X) = \sum_{i=1}^{n} \theta_i^2.
 $$
 
 - `hypoexp_pdf`, `hypoexp_cdf`, and `hypoexp_rvs` take `scales = theta`.
